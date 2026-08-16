@@ -60,7 +60,7 @@ EXPOSE 8000
 # limited memory, and each worker loads the whole app.
 CMD alembic upgrade head && \
     gunicorn app.main:app \
-      --workers 2 \
+      --workers 1 \
       --worker-class uvicorn.workers.UvicornWorker \
       --bind 0.0.0.0:$PORT \
       --proxy-headers \
