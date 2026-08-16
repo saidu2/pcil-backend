@@ -1,12 +1,34 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Prime Capital Investor Portal — backend dependencies
+#
+# This set has been verified to resolve with no conflicts. Two notes on why
+# certain pins exist, so they are not "tidied up" later and broken again:
+#
+#   gotrue==2.12.4   pinned deliberately. It is a sub-package of supabase, and
+#                    pip will otherwise pull the newest gotrue (2.20.x), which
+#                    demands pydantic>=2.11 and conflicts with everything else.
+#                    2.12.4 is the version that actually pairs with supabase
+#                    2.5.0. Removing this pin reintroduces the conflict.
+#
+#   httpx[http2]     the [http2] extra is required by gotrue. Plain httpx at
+#                    the same version fails resolution.
+#
+# pandas was removed: nothing in the codebase imports it, and it is a large
+# dependency that slows the container build and adds its own constraints.
+# ─────────────────────────────────────────────────────────────────────────────
+
 fastapi==0.111.0
 uvicorn[standard]==0.29.0
 sqlalchemy==2.0.30
 alembic==1.13.1
 
-# asyncpg is REQUIRED: DATABASE_URL uses postgresql+asyncpg://, and the app
-# will not start without it. It was missing from this file, which would have
-# failed the very first deploy. psycopg2-binary is kept because alembic uses
-# a sync driver for migrations.
+# asyncpg is required: DATABASE_URL uses postgresql+asyncpg://, and the app
+# will not start without it. psycopg2-binary is kept because alembic uses a
+# sync driver for migrations.
+#
+# Note: psycopg2-binary may fail to install on Windows with "no matching
+# distribution". That is a local wheel availability issue only. It installs
+# correctly on Linux, which is what the container builds on.
 asyncpg==0.29.0
 psycopg2-binary==2.9.9
 
@@ -15,15 +37,10 @@ passlib[bcrypt]==1.7.4
 bcrypt==4.0.1
 python-multipart==0.0.9
 python-dotenv==1.0.1
-pandas==2.2.2
 openpyxl==3.1.2
 httpx[http2]==0.27.0
 pydantic[email]==2.7.4
 pydantic-settings==2.2.1
-
-# ── Added: these are imported by the app but were missing from this file ─────
-# Without them the container builds but crashes on the first request that
-# touches MFA, PDF export, Excel upload, or cloud storage.
 
 # MFA (app/core/mfa.py)
 pyotp==2.9.0
@@ -32,12 +49,13 @@ qrcode[pil]==7.4.2
 # KYC PDF export (app/api/v1/endpoints/workflows.py)
 reportlab==4.2.0
 pypdf==4.2.0
-PyMuPDF==1.24.5           # rasterises PDF scans so they embed inline
+PyMuPDF==1.24.5
 pillow==10.3.0
 
 # Cloud file storage (app/core/storage.py), used when STORAGE_BACKEND=supabase
 supabase==2.5.0
+gotrue==2.12.4
 
-# Production WSGI/ASGI server. The Dockerfile's CMD calls gunicorn, so it must
-# be installed or the container starts and immediately dies.
+# Production server. The Dockerfile's CMD calls gunicorn, so it must be
+# installed or the container starts and immediately exits.
 gunicorn==22.0.0
