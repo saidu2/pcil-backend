@@ -1,0 +1,64 @@
+# Prime Capital Backend — .gitignore
+# Never commit these to version control
+
+# Environment variables (contains passwords, API keys, secrets)
+.env
+.env.local
+.env.staging
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environment
+venv/
+env/
+.venv/
+ENV/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+*.xml
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Alembic (keep versions folder but not temp files)
+alembic/versions/*.pyc
+
+# Logs
+*.log
+logs/
+
+# Docker
+.dockerignore
+
+# macOS
+.DS_Store
+
+# ── Uploaded client files ─────────────────────────────────────────────────────
+# ADDED: with STORAGE_BACKEND=local, real client KYC documents (passports,
+# utility bills, CAC certificates) and avatars are written here. These are
+# client identity documents and must never enter version control.
+app/static/kyc-documents/
+app/static/avatars/
+
+# The logo IS required in the repo: the KYC PDF export reads it from disk to
+# build the letterhead. Without it the PDF silently falls back to text only.
+!app/static/pci_logo.png
+
+# Temporary PNGs created while rasterising PDF pages for inline embedding
+app/static/**/*.rendered.png
+render_env_reference.txt 
