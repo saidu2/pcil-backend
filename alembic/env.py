@@ -24,14 +24,11 @@
 #  Always use Alembic migrations so changes are tracked in version control.
 # ─────────────────────────────────────────────────────────────────────────────
 
-import asyncio
 import os
 import sys
 from logging.config import fileConfig
 
-from sqlalchemy import pool
 from sqlalchemy.engine import Connection
-from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from alembic import context
 
@@ -53,7 +50,16 @@ if config.config_file_name is not None:
 # ── Import models so Alembic can detect them ─────────────────────────────────
 # Every model class must be imported here (or in a module that imports them all).
 # If you add a new model file, import it below.
-from app.db.session import Base
+#
+# IMPORTANT: we import `engine` from app.db.session here too, and reuse it
+# directly below instead of building a second, separate engine via
+# async_engine_from_config. That second engine had none of the pgbouncer /
+# async_creator protection that session.py's engine has, which is why
+# migrations kept hitting DuplicatePreparedStatementError even after the
+# app's own engine was fixed — Alembic was never using the fixed engine at
+# all. Reusing the same engine object means there is only one connection
+# setup to maintain, and it is always the protected one.
+from app.db.session import Base, engine
 from app.models import models  # noqa: F401 — imports all models
 from app.core.config import settings
 
@@ -87,19 +93,21 @@ def do_run_migrations(connection: Connection) -> None:
 
 
 async def run_async_migrations() -> None:
-    """Run migrations using async SQLAlchemy engine."""
-    connectable = async_engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
-    )
-    async with connectable.connect() as connection:
+    """
+    Run migrations using the app's own engine from app/db/session.py.
+
+    This engine already has the pgbouncer / async_creator fix applied when
+    running against Supabase's pooled connection, so migrations no longer
+    need (and must not build) a second, unprotected engine.
+    """
+    async with engine.connect() as connection:
         await connection.run_sync(do_run_migrations)
-    await connectable.dispose()
+    await engine.dispose()
 
 
 def run_migrations_online() -> None:
     """Run migrations in 'online' mode — connects to the database directly."""
+    import asyncio
     asyncio.run(run_async_migrations())
 
 
