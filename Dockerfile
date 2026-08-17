@@ -63,7 +63,7 @@ CMD alembic upgrade head && \
       --workers 1 \
       --worker-class uvicorn.workers.UvicornWorker \
       --bind 0.0.0.0:$PORT \
-      --proxy-headers \
+   
       --forwarded-allow-ips="*" \
       --timeout 120 \
       --access-logfile - \
