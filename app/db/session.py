@@ -1,3 +1,6 @@
+import uuid
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # app/db/session.py
 #
@@ -40,11 +43,10 @@ _IS_POOLED = "pooler.supabase.com" in settings.DATABASE_URL or ":6543" in settin
 _connect_args = {}
 if _IS_POOLED:
     _connect_args = {
-        # Disable asyncpg's prepared statement cache entirely.
         "statement_cache_size": 0,
         "prepared_statement_cache_size": 0,
+        "prepared_statement_name_func": lambda: f"__asyncpg_{uuid.uuid4()}__",
     }
-
 
 # ── Engine ────────────────────────────────────────────────────────────────────
 # pool_pre_ping=True tests a connection before handing it out, which avoids
