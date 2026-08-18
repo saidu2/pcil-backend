@@ -144,6 +144,7 @@ class TokenResponse(BaseModel):
     must_change_password: bool = False  # NEW in v11 — True if client has a temp password active
     mfa_required: bool = False  # NEW in v11 — True if this account has MFA enabled (client MFA is optional)
     mfa_token: Optional[str] = None  # NEW in v11 — set alongside mfa_required, exchanged at /auth/mfa/login-verify
+    email_verification_required: bool = False  # NEW — True on register(), signals frontend to route to /verify-email-pending instead of the dashboard
     # Note: refresh_token is set as an HttpOnly cookie, not in this body
 
 
@@ -560,12 +561,17 @@ class RedemptionResponse(BaseModel):
     id: UUID
     user_id: UUID
     subscription_id: UUID
+    holding_id: Optional[UUID] = None
     amount: float
     currency: str
     penalty: float
     net_amount: float
     reference: str
     is_premature: bool
+    units_sold: Optional[float] = None
+    sale_price: Optional[float] = None
+    cost_price_at_sale: Optional[float] = None
+    realized_gain: Optional[float] = None
     status: str
     requested_at: datetime
     processed_at: Optional[datetime]
@@ -849,6 +855,7 @@ class PortfolioHoldingCreate(BaseModel):
 class PortfolioHoldingRedeem(BaseModel):
     """Body for partially or fully redeeming one holding."""
     units_or_amount: float = Field(gt=0)  # units for equity, currency amount for fixed income
+    sale_price: Optional[float] = Field(default=None, gt=0)  # REQUIRED for equity — price per unit the sale executed at, used to compute realized gain/loss. Not applicable to fixed income.
     note: Optional[str] = None
 
 

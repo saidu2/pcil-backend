@@ -7,7 +7,6 @@
 # request finishes (even if an exception is raised).
 # ─────────────────────────────────────────────────────────────────────────────
 
-import uuid
 import asyncpg
 
 from sqlalchemy.ext.asyncio import (

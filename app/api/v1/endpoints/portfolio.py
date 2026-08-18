@@ -18,6 +18,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 import logging
+import secrets
 from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID
@@ -30,7 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session import get_db
 from app.models.models import (
     PortfolioHolding, InstrumentPrice, PortfolioValuation,
-    Subscription, AdminUser, AuditLog, User, SystemSettings,
+    Subscription, AdminUser, AuditLog, User, SystemSettings, Redemption,
 )
 from app.schemas.schemas import (
     PortfolioHoldingCreate, PortfolioHoldingResponse, PortfolioHoldingRedeem,
@@ -206,6 +207,16 @@ async def update_holding(
     return holding
 
 
+def _generate_redemption_reference() -> str:
+    """
+    Unique, human-scannable reference for a redemption record, e.g.
+    RDM-8F2C9A1B. Kept local rather than importing the subscription
+    reference generator, since redemptions live in a different module
+    and don't need to share its exact format.
+    """
+    return f"RDM-{secrets.token_hex(4).upper()}"
+
+
 @router.patch(
     "/holdings/{holding_id}/redeem",
     response_model=PortfolioHoldingResponse,
@@ -220,10 +231,26 @@ async def redeem_holding(
     """
     Reduces a holding's units (equity) or principal (fixed income) by the
     given amount. Marks it 'redeemed' if that brings it to zero, otherwise
-    'partially_redeemed'. Does NOT touch the client-facing Redemption
-    approval workflow yet — that wiring is a deliberate fast-follow. For
-    now this only updates the holding; run-valuation afterward reflects
-    the new total.
+    'partially_redeemed'.
+
+    For equities, this now also creates a Redemption record capturing what
+    the sale actually executed at and the resulting realized gain/loss —
+    previously the units were silently reduced with no transaction record
+    at all. sale_price is REQUIRED for equity redemptions; without it there
+    is no way to know what the units were sold for, and no way to ever show
+    a client what they made or lost on the sale.
+
+    The Redemption created here is recorded as already 'completed', not
+    'pending' — this endpoint IS the admin's authoritative execution of the
+    sale (can_manage_nav), so there is nothing left to approve afterward.
+    This does not yet route through the separate client-initiated
+    /redemptions request-and-approval flow (RedemptionCreate) — that
+    remains a distinct path for clients requesting an early exit. Wiring
+    the two together, if desired, is a separate decision.
+
+    For fixed income, principal is reduced the same as before; no sale
+    price/realized-gain concept applies, so no Redemption record is
+    created for that branch (unchanged from prior behaviour).
     """
     holding = await db.get(PortfolioHolding, holding_id)
     if not holding:
@@ -231,11 +258,48 @@ async def redeem_holding(
     if holding.status == "redeemed":
         raise HTTPException(status_code=400, detail="This holding has already been fully redeemed.")
 
+    redemption_record = None
+
     if holding.holding_type == "equity":
         if body.units_or_amount > (holding.units or 0):
             raise HTTPException(status_code=400, detail=f"Cannot redeem more than the {holding.units} units held.")
+        if not body.sale_price:
+            raise HTTPException(
+                status_code=400,
+                detail="sale_price is required when redeeming an equity holding, to record what the units sold for.",
+            )
+
+        sub = await db.get(Subscription, holding.subscription_id)
+        if not sub:
+            raise HTTPException(status_code=404, detail="Underlying subscription not found for this holding.")
+
+        cost_price_at_sale = holding.cost_price or 0.0
+        proceeds = round(body.sale_price * body.units_or_amount, 2)
+        realized_gain = round((body.sale_price - cost_price_at_sale) * body.units_or_amount, 2)
+
         holding.units -= body.units_or_amount
         holding.status = "redeemed" if holding.units <= 0 else "partially_redeemed"
+
+        redemption_record = Redemption(
+            user_id=sub.user_id,
+            subscription_id=holding.subscription_id,
+            holding_id=holding.id,
+            amount=proceeds,
+            currency=sub.currency,
+            penalty=0.0,
+            net_amount=proceeds,
+            reference=_generate_redemption_reference(),
+            is_premature=False,
+            units_sold=body.units_or_amount,
+            sale_price=body.sale_price,
+            cost_price_at_sale=cost_price_at_sale,
+            realized_gain=realized_gain,
+            status="completed",
+            note=body.note,
+            processed_at=datetime.now(timezone.utc),
+            processed_by=admin.full_name,
+        )
+        db.add(redemption_record)
     else:
         if body.units_or_amount > (holding.principal or 0):
             raise HTTPException(status_code=400, detail=f"Cannot redeem more than the principal of {holding.principal}.")
@@ -245,7 +309,14 @@ async def redeem_holding(
     db.add(AuditLog(
         action="Portfolio Holding Redeemed", target=holding.instrument_name, target_id=str(holding_id),
         action_type="admin", performed_by=admin.id, performed_by_name=admin.full_name,
-        details={"units_or_amount": body.units_or_amount, "note": body.note, "new_status": holding.status},
+        details={
+            "units_or_amount": body.units_or_amount, "note": body.note, "new_status": holding.status,
+            **({
+                "sale_price": redemption_record.sale_price,
+                "realized_gain": redemption_record.realized_gain,
+                "redemption_reference": redemption_record.reference,
+            } if redemption_record else {}),
+        },
     ))
     await db.commit()
     await db.refresh(holding)
@@ -713,6 +784,109 @@ async def get_valuation_history_admin(
 # PUBLIC — CLIENT DASHBOARD
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _group_equity_holdings(holdings: list[PortfolioHolding]) -> list[dict]:
+    """
+    Groups equity holdings by instrument_name for client-facing display,
+    so someone who bought MTN N twice at different prices sees ONE "MTN N"
+    line instead of two separate rows. Purely a display transform — the
+    underlying PortfolioHolding rows are untouched, so admin tooling,
+    per-lot redemption, and audit history all keep working exactly as
+    before against the individual lots.
+
+    Fixed income holdings are passed through unchanged (one row each) —
+    each placement has its own maturity date and rate, so merging them
+    would lose information a client actually needs to see.
+
+    Weighted-average cost_price is units-weighted across the lots being
+    grouped, purely for display. lot_ids/lot_count are included so the
+    frontend can, if useful, indicate "bought in 2 purchases".
+    """
+    equity = [h for h in holdings if h.holding_type == "equity"]
+    fixed_income = [h for h in holdings if h.holding_type != "equity"]
+
+    grouped: dict[str, dict] = {}
+    for h in equity:
+        g = grouped.setdefault(h.instrument_name, {
+            "id": None,  # synthetic group, not a single holding id — see lot_ids
+            "type": "equity",
+            "name": h.instrument_name,
+            "units": 0.0,
+            "_cost_total": 0.0,   # units * cost_price, summed — divided out below
+            "lot_ids": [],
+            "statuses": set(),
+        })
+        units = h.units or 0.0
+        g["units"] += units
+        g["_cost_total"] += units * (h.cost_price or 0.0)
+        g["lot_ids"].append(str(h.id))
+        g["statuses"].add(h.status)
+
+    out = []
+    for g in grouped.values():
+        cost_price = round(g["_cost_total"] / g["units"], 4) if g["units"] else None
+        out.append({
+            "id": g["lot_ids"][0] if len(g["lot_ids"]) == 1 else None,
+            "type": "equity",
+            "name": g["name"],
+            "units": g["units"],
+            "cost_price": cost_price,
+            "principal": None,
+            "roi_pct": None,
+            "maturity_date": None,
+            "status": "partially_redeemed" if "partially_redeemed" in g["statuses"] else "active",
+            "lot_ids": g["lot_ids"],
+            "lot_count": len(g["lot_ids"]),
+        })
+
+    out.extend({
+        "id": str(h.id), "type": h.holding_type, "name": h.instrument_name,
+        "units": h.units, "cost_price": h.cost_price,
+        "principal": h.principal, "roi_pct": h.roi_pct,
+        "maturity_date": h.maturity_date.isoformat() if h.maturity_date else None,
+        "status": h.status,
+        "lot_ids": [str(h.id)], "lot_count": 1,
+    } for h in fixed_income)
+
+    return out
+
+
+def _group_equity_breakdown(breakdown: Optional[list]) -> list:
+    """
+    Same grouping as _group_equity_holdings, applied to a valuation
+    snapshot's per-holding breakdown (see PortfolioValuation.breakdown /
+    _value_holding), so the current value shown against the merged
+    display row is the combined value of all its underlying lots, not
+    just one of them.
+    """
+    if not breakdown:
+        return []
+
+    equity = [b for b in breakdown if b.get("type") == "equity"]
+    other = [b for b in breakdown if b.get("type") != "equity"]
+
+    grouped: dict[str, dict] = {}
+    for b in equity:
+        g = grouped.setdefault(b["name"], {
+            "name": b["name"], "type": "equity",
+            "units": 0.0, "value": 0.0, "price": b.get("price"), "lot_ids": [],
+        })
+        g["units"] += b.get("units") or 0.0
+        g["value"] += b.get("value") or 0.0
+        g["lot_ids"].append(b.get("holding_id"))
+
+    return other + [
+        {
+            "holding_id": g["lot_ids"][0] if len(g["lot_ids"]) == 1 else None,
+            "lot_ids": g["lot_ids"],
+            "name": g["name"], "type": "equity",
+            "units": round(g["units"], 4),
+            "price": g["price"],
+            "value": round(g["value"], 2),
+        }
+        for g in grouped.values()
+    ]
+
+
 @public_router.get("/my-holdings", summary="My portfolio holdings, current value, and history")
 async def my_holdings(
     db: AsyncSession = Depends(get_db),
@@ -722,6 +896,12 @@ async def my_holdings(
     Returns every active portfolio (Subscription) the client holds, with
     its current holdings breakdown and valuation history for charting.
     Falls back gracefully if no valuation has been run yet.
+
+    Equity holdings are grouped by instrument name for display (see
+    _group_equity_holdings) — a client who bought the same stock twice at
+    different prices sees one combined line, not two. This is a display-
+    only transform; nothing about how holdings/redemptions/audit history
+    are stored on the backend changes.
     """
     subs_result = await db.execute(
         select(Subscription).where(
@@ -772,17 +952,8 @@ async def my_holdings(
             # every historical snapshot, since the chart only needs totals
             # and sending every breakdown would bloat the response.
             "show_breakdown": show_breakdown,
-            "latest_breakdown": (latest.breakdown if latest else []) if show_breakdown else [],
-            "holdings": [
-                {
-                    "id": str(h.id), "type": h.holding_type, "name": h.instrument_name,
-                    "units": h.units, "cost_price": h.cost_price,
-                    "principal": h.principal, "roi_pct": h.roi_pct,
-                    "maturity_date": h.maturity_date.isoformat() if h.maturity_date else None,
-                    "status": h.status,
-                }
-                for h in holdings
-            ] if show_breakdown else [],
+            "latest_breakdown": _group_equity_breakdown(latest.breakdown if latest else []) if show_breakdown else [],
+            "holdings": _group_equity_holdings(holdings) if show_breakdown else [],
             "value_history": [
                 # `breakdown` (per-holding values) is only included on the
                 # LATEST snapshot — that's all the dashboard needs to show
@@ -791,7 +962,7 @@ async def my_holdings(
                 # response for no benefit (the chart only needs the totals).
                 {"date": v.valuation_date.isoformat(), "total_value": v.total_value,
                  "equities_value": v.equities_value, "fixed_income_value": v.fixed_income_value,
-                 **({"breakdown": v.breakdown or []} if show_breakdown and latest and v.id == latest.id else {})}
+                 **({"breakdown": _group_equity_breakdown(v.breakdown)} if show_breakdown and latest and v.id == latest.id else {})}
                 for v in history
             ],
         })

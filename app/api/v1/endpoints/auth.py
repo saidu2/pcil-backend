@@ -163,7 +163,7 @@ async def register(
     await _issue_verification_email(user, request, db)
 
     logger.info(f"New client registered: {user.email}")
-    return TokenResponse(access_token=access_token)
+    return TokenResponse(access_token=access_token, email_verification_required=True)
 
 
 @router.post(

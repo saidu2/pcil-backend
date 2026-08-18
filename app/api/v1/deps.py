@@ -297,3 +297,29 @@ async def get_current_user_password_ok(
             detail="You must change your temporary password before continuing.",
         )
     return current_user
+
+
+async def get_current_verified_email_user(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    """
+    Like get_current_user, but blocks access until the client has confirmed
+    their email address (NEW). Registration issues a real access token
+    immediately (see auth.py register()), so a client is technically
+    "logged in" the moment they sign up, before ever clicking the
+    confirmation link — this dependency is what turns that into an
+    actual gate.
+
+    Use on dashboard/portfolio/subscription endpoints — anywhere real
+    access should wait for a confirmed email address.
+
+    Deliberately NOT applied to /auth/me, /auth/logout, /auth/verify-email,
+    or /auth/resend-verification — those must stay reachable regardless of
+    verification status, or a client can never get past this gate at all.
+    """
+    if not current_user.is_verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Please confirm your email address before continuing.",
+        )
+    return current_user

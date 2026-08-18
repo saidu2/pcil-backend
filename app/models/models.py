@@ -529,6 +529,12 @@ class Redemption(Base):
     subscription_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("subscriptions.id"), nullable=False
     )
+    # Which specific holding this redemption came from, when known (NEW).
+    # Nullable because older/other redemption paths operate at the
+    # subscription level rather than a specific PortfolioHolding row.
+    holding_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("portfolio_holdings.id", ondelete="SET NULL"), nullable=True
+    )
 
     amount: Mapped[float] = mapped_column(Float, nullable=False)
     currency: Mapped[str] = mapped_column(String(10), default="NGN")
@@ -536,6 +542,16 @@ class Redemption(Base):
     net_amount: Mapped[float] = mapped_column(Float, default=0.0)  # amount - penalty
     reference: Mapped[str] = mapped_column(String(100), unique=True)
     is_premature: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # ── Equity sale detail (NEW) ─────────────────────────────────────────────
+    # Populated when this redemption came from selling equity units (see
+    # PortfolioHolding.redeem). Lets the platform actually show a client
+    # what they made or lost on a sale, instead of only reducing their
+    # position with no record of the transaction itself.
+    units_sold: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    sale_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # price per unit at sale
+    cost_price_at_sale: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # snapshot of the holding's cost basis used for the gain calc below
+    realized_gain: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # (sale_price - cost_price_at_sale) * units_sold
 
     status: Mapped[str] = mapped_column(
         SAEnum("pending", "processing", "completed", "rejected", name="redemption_status_enum"),
@@ -555,6 +571,7 @@ class Redemption(Base):
 
     user: Mapped["User"] = relationship(back_populates="redemptions")
     subscription: Mapped["Subscription"] = relationship(back_populates="redemptions")
+    holding: Mapped[Optional["PortfolioHolding"]] = relationship()
 
     __table_args__ = (
         Index("ix_redemptions_status",     "status"),
