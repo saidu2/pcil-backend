@@ -23,7 +23,7 @@ from app.core.config import settings
 from app.core.security_middleware import SecurityHeadersMiddleware, RateLimitMiddleware
 from app.api.v1.endpoints import (
     auth, webhooks, products, kyc, subscriptions,
-    redemptions, system, admin_users, nav, staff_roles, workflows, portfolio,
+    redemptions, system, admin_users, nav, staff_roles, workflows, portfolio, certificates,
 )
 
 logging.basicConfig(
@@ -121,6 +121,7 @@ app.include_router(kyc.admin_router,           prefix=f"{V1}/admin/kyc",        
 app.include_router(workflows.kyc_export_router, prefix=f"{V1}/admin/kyc",            tags=["Admin — KYC"])
 app.include_router(subscriptions.admin_router, prefix=f"{V1}/admin/subscriptions",   tags=["Admin — Subscriptions"])
 app.include_router(redemptions.admin_router,   prefix=f"{V1}/admin/redemptions",     tags=["Admin — Redemptions"])
+app.include_router(certificates.admin_router,  prefix=f"{V1}/admin/certificates",    tags=["Admin — Certificates"])
 app.include_router(system.admin_router,        prefix=f"{V1}/admin",                 tags=["Admin — Settings & Reports"])
 app.include_router(admin_users.router,         prefix=f"{V1}/admin/users",           tags=["Admin — Users"])
 app.include_router(staff_roles.router,         prefix=f"{V1}/admin/staff-roles",     tags=["Admin — Staff Roles"])

@@ -999,3 +999,53 @@ class WorkflowStepUpdate(BaseModel):
     available_actions: Optional[str] = None
     sla_hours: Optional[int] = Field(default=None, ge=1)
     notify_ceo: Optional[bool] = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CERTIFICATE SCHEMAS
+# ─────────────────────────────────────────────────────────────────────────────
+
+class CertificateCreate(BaseModel):
+    """Body for POST /admin/certificates — admin issues a certificate."""
+    user_id: UUID
+    subscription_id: Optional[UUID] = None
+    product_name: str
+    amount: str                        # display string, e.g. "₦5,000,000"
+    roi: Optional[str] = None
+    issue_date: str
+    maturity_date: Optional[str] = None
+    account_type: str
+
+
+class CertificateUpdate(BaseModel):
+    """
+    Body for PATCH /admin/certificates/{id} — edit a previously issued
+    certificate. All optional, so a correction only needs to touch the
+    field(s) that were wrong. Also used to revoke a certificate by setting
+    status="revoked".
+    """
+    product_name: Optional[str] = None
+    amount: Optional[str] = None
+    roi: Optional[str] = None
+    issue_date: Optional[str] = None
+    maturity_date: Optional[str] = None
+    account_type: Optional[str] = None
+    status: Optional[str] = None       # issued | emailed | revoked
+
+
+class CertificateResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    user_id: UUID
+    subscription_id: Optional[UUID] = None
+    reference: str
+    product_name: str
+    amount: str
+    roi: Optional[str] = None
+    issue_date: str
+    maturity_date: Optional[str] = None
+    account_type: str
+    status: str
+    emailed_at: Optional[datetime] = None
+    issued_at: datetime
