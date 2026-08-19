@@ -85,12 +85,6 @@ def generate_redemption_reference() -> str:
 # CLIENT ENDPOINTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.post(
-    "",
-    response_model=RedemptionResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Request a redemption (withdrawal)",
-)
 async def _request_holding_redemption(
     body: RedemptionCreate,
     db: AsyncSession,
@@ -190,6 +184,12 @@ async def _request_holding_redemption(
     return redemption
 
 
+@router.post(
+    "",
+    response_model=RedemptionResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Request a redemption (withdrawal)",
+)
 async def request_redemption(
     body: RedemptionCreate,
     db: AsyncSession = Depends(get_db),
@@ -441,11 +441,6 @@ async def admin_list_redemptions(
     ]
 
 
-@admin_router.patch(
-    "/{redemption_id}/process",
-    response_model=MessageResponse,
-    summary="Admin: Process a redemption request",
-)
 async def _complete_holding_redemption(
     redemption: Redemption,
     sale_price: float,
@@ -528,6 +523,11 @@ async def _complete_holding_redemption(
     return MessageResponse(message=f"Redemption {redemption.reference} completed.")
 
 
+@admin_router.patch(
+    "/{redemption_id}/process",
+    response_model=MessageResponse,
+    summary="Admin: Process a redemption request",
+)
 async def process_redemption(
     redemption_id: UUID,
     action: str,  # complete | reject
