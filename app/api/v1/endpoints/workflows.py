@@ -567,7 +567,7 @@ async def export_kyc_pdf(
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import mm
     from reportlab.lib import colors
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable, Image
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable, Image, KeepTogether
     from reportlab.lib.utils import ImageReader
     from pypdf import PdfReader, PdfWriter
     from pathlib import Path
@@ -796,6 +796,14 @@ async def export_kyc_pdf(
         upload format shouldn't determine the layout. Returns True if
         something was embedded/noted, False if there was no URL at all
         (caller decides how to show "Not uploaded" in its own layout).
+
+        The label and its image are wrapped together in KeepTogether —
+        without this, ReportLab is free to insert a page break between the
+        label paragraph and the image that follows it (they're otherwise
+        two independent flowables with no relationship), which is exactly
+        what was producing a label on one page and its actual photo on the
+        next. KeepTogether forces them to move to a fresh page as a single
+        unit if they don't both fit on the current one.
         """
         if not url:
             return False
@@ -813,13 +821,15 @@ async def export_kyc_pdf(
                 temp_rendered_files.append(embed_path)
         if embed_path:
             try:
-                elements_list.append(Paragraph(f"<b>{label}</b>", label_style))
                 img = ImageReader(str(embed_path))
                 iw, ih = img.getSize()
                 display_w = 35 * mm
                 display_h = display_w * ih / iw
-                elements_list.append(Image(str(embed_path), width=display_w, height=display_h))
-                elements_list.append(Spacer(1, 6))
+                elements_list.append(KeepTogether([
+                    Paragraph(f"<b>{label}</b>", label_style),
+                    Image(str(embed_path), width=display_w, height=display_h),
+                    Spacer(1, 6),
+                ]))
                 return True
             except Exception as e:
                 logger.warning(f"Could not embed image {label}: {e}")
