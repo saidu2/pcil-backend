@@ -31,7 +31,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.core.storage import read_local_path
+from app.core.storage import read_local_path, read_file_bytes
 from app.db.session import get_db
 from app.models.models import (
     Workflow, WorkflowStep, WorkflowInstance,
@@ -743,15 +743,22 @@ async def export_kyc_pdf(
             # Local-style URL but the file is missing
             return None
 
-        # Remote file: download to a temp path for embedding
+        # Remote file: read via storage.py's authenticated download rather
+        # than a plain HTTP fetch. KYC documents live in a PRIVATE Supabase
+        # bucket by design (see storage.py) — a plain urllib fetch of the
+        # stored URL always fails silently for a private bucket, regardless
+        # of anything else, which is why documents were never actually
+        # appearing in this PDF. read_file_bytes() is the same
+        # authenticated path already used elsewhere in the app to view KYC
+        # documents correctly.
         try:
-            import urllib.request
             import tempfile
+            content, _ = read_file_bytes(url)
+            if not content:
+                return None
             suffix = Path(url.split("?")[0]).suffix or ".bin"
-            with urllib.request.urlopen(url, timeout=10) as resp:
-                data = resp.read()
             tmp = Path(tempfile.gettempdir()) / f"kycdl_{uuid4().hex[:10]}{suffix}"
-            tmp.write_bytes(data)
+            tmp.write_bytes(content)
             temp_rendered_files.append(tmp)  # cleaned up after the PDF is built
             return tmp
         except Exception as e:
