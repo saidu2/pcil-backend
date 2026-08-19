@@ -68,6 +68,21 @@ SUPABASE_URL = _cfg("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = _cfg("SUPABASE_SERVICE_KEY")
 SUPABASE_BUCKET = _cfg("SUPABASE_BUCKET", "pcil-uploads")
 
+# Avatars are low-sensitivity and need to load directly in a plain <img src>,
+# unlike KYC documents (passports, utility bills) which must stay private and
+# only ever reach the browser through the authenticated streaming endpoint
+# (read_file_bytes). Rather than forcing both through the same private
+# bucket — where get_public_url() silently returns a URL that doesn't
+# actually work — avatars go to their own PUBLIC bucket instead.
+SUPABASE_AVATAR_BUCKET = _cfg("SUPABASE_AVATAR_BUCKET", "pcil-avatars")
+
+# Folders routed to the public avatar bucket rather than the private one.
+_PUBLIC_FOLDERS = {"avatars"}
+
+
+def _bucket_for_folder(folder: str) -> str:
+    return SUPABASE_AVATAR_BUCKET if folder in _PUBLIC_FOLDERS else SUPABASE_BUCKET
+
 # Local disk root — matches where main.py mounts /static
 LOCAL_STATIC_DIR = Path(__file__).resolve().parents[1] / "static"
 
@@ -115,14 +130,15 @@ def save_file(content: bytes, folder: str, filename: str, content_type: Optional
     """
     if STORAGE_BACKEND == "supabase":
         client = _supabase_client()
+        bucket = _bucket_for_folder(folder)
         path = f"{folder}/{filename}"
-        client.storage.from_(SUPABASE_BUCKET).upload(
+        client.storage.from_(bucket).upload(
             path=path,
             file=content,
             file_options={"content-type": content_type or "application/octet-stream", "upsert": "true"},
         )
-        url = client.storage.from_(SUPABASE_BUCKET).get_public_url(path)
-        logger.info(f"File saved to Supabase: {path}")
+        url = client.storage.from_(bucket).get_public_url(path)
+        logger.info(f"File saved to Supabase ({bucket}): {path}")
         return url
 
     # Local disk
@@ -132,6 +148,19 @@ def save_file(content: bytes, folder: str, filename: str, content_type: Optional
     base = (request_base_url or "http://localhost:8000").rstrip("/")
     logger.info(f"File saved locally: {folder}/{filename}")
     return f"{base}/static/{folder}/{filename}"
+
+
+def _bucket_and_path_from_url(url: str):
+    """
+    Works out which Supabase bucket a stored URL belongs to (private
+    SUPABASE_BUCKET or the public SUPABASE_AVATAR_BUCKET) and the object
+    path within it. Returns (None, None) if the URL doesn't match either.
+    """
+    for bucket in (SUPABASE_BUCKET, SUPABASE_AVATAR_BUCKET):
+        marker = f"/{bucket}/"
+        if marker in url:
+            return bucket, url.split(marker, 1)[1].split("?")[0]
+    return None, None
 
 
 def delete_file(url: str) -> bool:
@@ -145,11 +174,10 @@ def delete_file(url: str) -> bool:
         return False
     try:
         if STORAGE_BACKEND == "supabase":
-            marker = f"/{SUPABASE_BUCKET}/"
-            if marker not in url:
+            bucket, path = _bucket_and_path_from_url(url)
+            if not bucket:
                 return False
-            path = url.split(marker, 1)[1].split("?")[0]
-            _supabase_client().storage.from_(SUPABASE_BUCKET).remove([path])
+            _supabase_client().storage.from_(bucket).remove([path])
             return True
 
         if "/static/" not in url:
@@ -186,13 +214,13 @@ def read_file_bytes(url: str):
 
     try:
         if STORAGE_BACKEND == "supabase":
-            marker = f"/{SUPABASE_BUCKET}/"
-            if marker in url:
-                path = url.split(marker, 1)[1].split("?")[0]
-            else:
-                # Already a bare storage path rather than a full URL
-                path = url.lstrip("/")
-            content = _supabase_client().storage.from_(SUPABASE_BUCKET).download(path)
+            bucket, path = _bucket_and_path_from_url(url)
+            if not bucket:
+                # Already a bare storage path rather than a full URL — assume
+                # the private bucket, since that's the only backend caller
+                # (read_file_bytes exists specifically for KYC documents).
+                bucket, path = SUPABASE_BUCKET, url.lstrip("/")
+            content = _supabase_client().storage.from_(bucket).download(path)
             return content, guessed
 
         local = read_local_path(url)
@@ -217,11 +245,10 @@ def get_signed_url(url: str, expires_in_seconds: int = 3600) -> str:
     if STORAGE_BACKEND != "supabase" or not url:
         return url
     try:
-        marker = f"/{SUPABASE_BUCKET}/"
-        if marker not in url:
+        bucket, path = _bucket_and_path_from_url(url)
+        if not bucket:
             return url
-        path = url.split(marker, 1)[1].split("?")[0]
-        result = _supabase_client().storage.from_(SUPABASE_BUCKET).create_signed_url(path, expires_in_seconds)
+        result = _supabase_client().storage.from_(bucket).create_signed_url(path, expires_in_seconds)
         return result.get("signedURL") or result.get("signed_url") or url
     except Exception as e:
         logger.warning(f"Could not sign URL {url}: {e}")
