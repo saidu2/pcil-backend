@@ -549,9 +549,19 @@ class SubscriptionAdminAction(BaseModel):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class RedemptionCreate(BaseModel):
-    """Body for POST /api/v1/redemptions — client requests redemption"""
+    """Body for POST /api/v1/redemptions — client requests redemption.
+
+    Two shapes, depending on what's being redeemed:
+      - Fixed income / subscription-level: subscription_id + amount.
+        (unchanged from before)
+      - Equity holding: subscription_id + holding_id + units, no amount —
+        the client can't know the sale price in advance, so there's nothing
+        to enter it against. The real price is set by admin at approval.
+    """
     subscription_id: UUID
-    amount: float
+    amount: Optional[float] = None
+    holding_id: Optional[UUID] = None
+    units: Optional[float] = Field(default=None, gt=0)
     note: Optional[str] = None
 
 

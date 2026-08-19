@@ -30,7 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session import get_db
 from app.models.models import (
     Redemption, Subscription, Product, FeeConfig, Notification, AuditLog, User,
-    Workflow, WorkflowInstance,
+    Workflow, WorkflowInstance, PortfolioHolding, InstrumentPrice,
 )
 from app.schemas.schemas import RedemptionCreate, RedemptionResponse, MessageResponse
 from app.api.v1.deps import get_current_user, get_current_admin, require_permission
@@ -91,6 +91,105 @@ def generate_redemption_reference() -> str:
     status_code=status.HTTP_201_CREATED,
     summary="Request a redemption (withdrawal)",
 )
+async def _request_holding_redemption(
+    body: RedemptionCreate,
+    db: AsyncSession,
+    current_user: User,
+) -> Redemption:
+    """
+    Handles the equity-holding branch of request_redemption. Kept separate
+    from the fixed-income logic above since the two share almost nothing:
+    no ROI accrual, no premature penalty, no subscription-amount ceiling —
+    just "does this holding have enough units, and is a request already
+    pending for it."
+    """
+    holding = await db.get(PortfolioHolding, body.holding_id)
+    if not holding:
+        raise HTTPException(status_code=404, detail="Holding not found.")
+
+    sub_result = await db.execute(
+        select(Subscription).where(Subscription.id == holding.subscription_id)
+    )
+    sub = sub_result.scalar_one_or_none()
+    if not sub or sub.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Holding not found.")
+
+    if holding.holding_type != "equity":
+        raise HTTPException(status_code=400, detail="Only equity holdings can be redeemed this way.")
+    if holding.status == "redeemed":
+        raise HTTPException(status_code=400, detail="This holding has already been fully redeemed.")
+    if not body.units or body.units > (holding.units or 0):
+        raise HTTPException(status_code=400, detail=f"Cannot redeem more than the {holding.units} units held.")
+
+    existing = await db.execute(
+        select(Redemption).where(
+            Redemption.holding_id == body.holding_id,
+            Redemption.status == "pending",
+        )
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="A redemption request is already pending for this holding.")
+
+    # Estimate only — the real value is set by admin at approval, once the
+    # sale actually executes. Falls back to cost_price if no market price is
+    # on file yet, so the estimate is never left at zero for no reason.
+    price_result = await db.execute(
+        select(InstrumentPrice)
+        .where(InstrumentPrice.instrument_name == holding.instrument_name)
+        .order_by(InstrumentPrice.price_date.desc())
+        .limit(1)
+    )
+    latest_price = price_result.scalar_one_or_none()
+    estimated_price = (latest_price.price if latest_price else None) or holding.cost_price or 0.0
+    estimated_value = round(estimated_price * body.units, 2)
+
+    redemption = Redemption(
+        user_id=current_user.id,
+        subscription_id=holding.subscription_id,
+        holding_id=holding.id,
+        amount=estimated_value,
+        currency=sub.currency,
+        penalty=0.0,
+        net_amount=estimated_value,
+        reference=generate_redemption_reference(),
+        is_premature=False,
+        units_sold=body.units,               # requested units — confirmed at approval
+        cost_price_at_sale=holding.cost_price,  # snapshot now; used for realized_gain later
+        note=body.note,
+        status="pending",
+    )
+    db.add(redemption)
+
+    notification = Notification(
+        user_id=current_user.id,
+        title="Redemption Request Submitted",
+        message=(
+            f"Your request to sell {body.units:g} units of {holding.instrument_name} has been submitted. "
+            f"Estimated value: {sub.currency} {estimated_value:,.2f} (final amount depends on the actual sale price)."
+        ),
+        notification_type="redemption",
+    )
+    db.add(notification)
+    await db.commit()
+    await db.refresh(redemption)
+
+    await _fire_workflow(
+        trigger="redemption_requested",
+        record_type="redemption",
+        record_id=redemption.id,
+        client_id=current_user.id,
+        client_name=current_user.full_name,
+        db=db,
+    )
+    await db.commit()
+
+    logger.info(
+        f"Equity redemption requested: {redemption.reference} by {current_user.email} "
+        f"({body.units} units of {holding.instrument_name})."
+    )
+    return redemption
+
+
 async def request_redemption(
     body: RedemptionCreate,
     db: AsyncSession = Depends(get_db),
@@ -99,14 +198,25 @@ async def request_redemption(
     """
     Submit a redemption request for an active subscription.
 
-    Checks:
-      - Subscription must belong to current user
-      - Subscription must be 'active' or 'matured'
-      - Amount cannot exceed subscription amount
-      - If before maturity: premature penalty is calculated and shown
+    Two request shapes (see RedemptionCreate):
+      - Fixed income / subscription-level (unchanged): subscription_id + amount.
+      - Equity holding (NEW): subscription_id + holding_id + units. No price
+        is collected from the client — the real sale price is set by admin
+        at approval, since the client can't know it in advance. `amount` is
+        populated here as an ESTIMATE only (latest known market price ×
+        units), and gets overwritten with the real proceeds once processed.
 
     Frontend: Called from Dashboard.jsx redeem button.
     """
+    if body.holding_id:
+        return await _request_holding_redemption(body, db, current_user)
+
+    if body.amount is None:
+        raise HTTPException(
+            status_code=400,
+            detail="amount is required when redeeming a subscription (omit it only when redeeming a specific holding via holding_id).",
+        )
+
     # Fetch subscription
     sub_result = await db.execute(
         select(Subscription).where(
@@ -290,6 +400,7 @@ async def admin_list_redemptions(
         .options(
             selectinload(Redemption.subscription).selectinload(Subscription.product),
             selectinload(Redemption.user),
+            selectinload(Redemption.holding),
         )
     )
     if status_filter:
@@ -317,6 +428,14 @@ async def admin_list_redemptions(
             "requested_at":   r.requested_at,
             "processed_at":   r.processed_at,
             "processed_by":   r.processed_by,
+            # Equity-specific — all None for ordinary subscription redemptions
+            "holding_id":         str(r.holding_id) if r.holding_id else None,
+            "instrument_name":    r.holding.instrument_name if r.holding else None,
+            "units_sold":         r.units_sold,
+            "sale_price":         r.sale_price,
+            "cost_price_at_sale": r.cost_price_at_sale,
+            "realized_gain":      r.realized_gain,
+            "is_equity_estimate": bool(r.holding_id and r.status == "pending"),  # true while `amount` is still just an estimate
         }
         for r in redemptions
     ]
@@ -327,10 +446,93 @@ async def admin_list_redemptions(
     response_model=MessageResponse,
     summary="Admin: Process a redemption request",
 )
+async def _complete_holding_redemption(
+    redemption: Redemption,
+    sale_price: float,
+    note: str,
+    db: AsyncSession,
+    admin,
+) -> MessageResponse:
+    """
+    Completes an equity-holding redemption request. This is the approval-
+    workflow equivalent of PortfolioHolding.redeem() in portfolio.py — same
+    calculation, but reached through client request + admin approval
+    instead of an admin acting unilaterally.
+    """
+    if not sale_price or sale_price <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="sale_price is required to complete an equity redemption — it's the actual price the sale executed at.",
+        )
+
+    holding = await db.get(PortfolioHolding, redemption.holding_id)
+    if not holding:
+        raise HTTPException(status_code=404, detail="The underlying holding no longer exists.")
+
+    units = redemption.units_sold or 0
+    if units > (holding.units or 0):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Requested {units} units, but the holding only has {holding.units} remaining — "
+                   f"it may have changed since this request was submitted. Reject this request and ask the client to resubmit.",
+        )
+
+    cost_price = redemption.cost_price_at_sale if redemption.cost_price_at_sale is not None else (holding.cost_price or 0.0)
+    proceeds = round(sale_price * units, 2)
+    realized_gain = round((sale_price - cost_price) * units, 2)
+
+    holding.units -= units
+    holding.status = "redeemed" if holding.units <= 0 else "partially_redeemed"
+
+    redemption.status = "completed"
+    redemption.sale_price = sale_price
+    redemption.cost_price_at_sale = cost_price
+    redemption.realized_gain = realized_gain
+    redemption.amount = proceeds       # overwrite the estimate with the real proceeds
+    redemption.net_amount = proceeds   # no penalty concept for equity sales
+    redemption.processed_at = datetime.now(timezone.utc)
+    redemption.processed_by = admin.full_name
+    if note:
+        redemption.note = note
+
+    notification = Notification(
+        user_id=redemption.user_id,
+        title="Redemption Processed ✓",
+        message=(
+            f"Your sale of {units:g} units of {holding.instrument_name} has been processed at "
+            f"{redemption.currency} {sale_price:,.2f} per unit. Proceeds: {redemption.currency} {proceeds:,.2f}."
+        ),
+        notification_type="redemption",
+    )
+    db.add(notification)
+
+    audit = AuditLog(
+        action="Redemption Completed (Equity)",
+        target=holding.instrument_name,
+        target_id=str(redemption.id),
+        action_type="redemption",
+        performed_by=admin.id,
+        performed_by_name=admin.full_name,
+        details={
+            "units_sold": units, "sale_price": sale_price,
+            "realized_gain": realized_gain, "reference": redemption.reference,
+        },
+    )
+    db.add(audit)
+    await db.commit()
+
+    logger.info(
+        f"Equity redemption completed: {redemption.reference} by {admin.email} "
+        f"({units} units @ {sale_price}, realized gain {realized_gain})."
+    )
+    return MessageResponse(message=f"Redemption {redemption.reference} completed.")
+
+
 async def process_redemption(
     redemption_id: UUID,
     action: str,  # complete | reject
     note: str = None,
+    sale_price: float = None,  # REQUIRED when completing an equity-holding redemption
     db: AsyncSession = Depends(get_db),
     admin=Depends(require_permission("redemptions")),
 ):
@@ -339,7 +541,9 @@ async def process_redemption(
     Admin panel → Redemption Management section.
 
     action options:
-      complete — payment has been made to client
+      complete — payment has been made to client (fixed income), or the
+                 equity sale has actually executed (holding-based — requires
+                 sale_price, the real price achieved).
       reject   — request rejected (with note explaining why)
     """
     if action not in ["complete", "reject"]:
@@ -358,6 +562,9 @@ async def process_redemption(
             status_code=400,
             detail=f"Only pending redemptions can be processed. Current status: {redemption.status}"
         )
+
+    if action == "complete" and redemption.holding_id:
+        return await _complete_holding_redemption(redemption, sale_price, note, db, admin)
 
     if action == "complete":
         redemption.status = "completed"
