@@ -30,10 +30,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session import get_db
 from app.models.models import (
     Redemption, Subscription, Product, FeeConfig, Notification, AuditLog, User,
-    Workflow, WorkflowInstance, PortfolioHolding, InstrumentPrice,
+    Workflow, WorkflowInstance, PortfolioHolding, InstrumentPrice, PortfolioValuation,
 )
 from app.schemas.schemas import RedemptionCreate, RedemptionResponse, MessageResponse
 from app.api.v1.deps import get_current_user, get_current_admin, require_permission
+from app.api.v1.endpoints.portfolio import _revalue_subscription
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -250,25 +251,8 @@ async def request_redemption(
 
     now = datetime.now(timezone.utc)
 
-    # Calculate accrued returns using product ROI
-    product_result = await db.execute(select(Product).where(Product.id == sub.product_id))
-    product = product_result.scalar_one_or_none()
-
-    roi_pct = 0.0
-    if product and product.roi:
-        nums = [n for n in _re.findall(r'[\d.]+', product.roi) if _re.match(r'^\d+\.?\d*$', n)]
-        if nums:
-            roi_pct = sum(float(n) for n in nums) / len(nums)
-
-    activated = sub.activated_at or sub.submitted_at
-    if activated:
-        activated_aware = activated.replace(tzinfo=timezone.utc) if activated.tzinfo is None else activated
-        months_active = max(0, int((now - activated_aware).days / 30))
-    else:
-        months_active = 0
-    accrued_returns = round(sub.amount * (roi_pct / 100 / 12) * months_active, 2)
-
-    # Subtract already completed/pending redemptions
+    # Subtract already completed/pending redemptions from this subscription's
+    # principal first — needed before computing real accrued gain below.
     already_redeemed_result = await db.execute(
         select(func.coalesce(func.sum(Redemption.amount), 0.0)).where(
             Redemption.subscription_id == sub.id,
@@ -276,7 +260,28 @@ async def request_redemption(
         )
     )
     already_redeemed = already_redeemed_result.scalar() or 0.0
-    total_redeemable = round(sub.amount + accrued_returns - already_redeemed, 2)
+    remaining_principal = max(0.0, sub.amount - already_redeemed)
+
+    # Real accrued gain, not a generic product-ROI projection. This
+    # platform is a managed private portfolio: the client subscribes with
+    # an amount, and admin adds the actual holdings afterward. There is no
+    # product where returns accrue automatically from a generic percentage,
+    # so redeemable balance can only ever reflect a REAL valuation — before
+    # admin has added holdings and run one, there is nothing to accrue, and
+    # only the remaining principal itself is redeemable.
+    valuation_result = await db.execute(
+        select(PortfolioValuation)
+        .where(PortfolioValuation.subscription_id == sub.id)
+        .order_by(PortfolioValuation.valuation_date.desc())
+        .limit(1)
+    )
+    latest_valuation = valuation_result.scalar_one_or_none()
+    accrued_returns = (
+        round(max(0.0, latest_valuation.total_value - remaining_principal), 2)
+        if latest_valuation else 0.0
+    )
+
+    total_redeemable = round(remaining_principal + accrued_returns, 2)
 
     # Validate amount
     if body.amount > total_redeemable:
@@ -514,6 +519,12 @@ async def _complete_holding_redemption(
         },
     )
     db.add(audit)
+
+    # Same reason as the direct-admin redeem path in portfolio.py — without
+    # this, the client's dashboard keeps showing whatever the last full
+    # valuation run computed, silently ignoring this sale.
+    await _revalue_subscription(holding.subscription_id, db, created_by=admin.id)
+
     await db.commit()
 
     logger.info(

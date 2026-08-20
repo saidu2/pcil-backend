@@ -318,6 +318,12 @@ async def redeem_holding(
             } if redemption_record else {}),
         },
     ))
+
+    # Without this, the client's dashboard would keep showing whatever the
+    # last full valuation run computed — silently ignoring this redemption
+    # until someone happens to manually re-run valuation for everyone.
+    await _revalue_subscription(holding.subscription_id, db, created_by=admin.id)
+
     await db.commit()
     await db.refresh(holding)
     return holding
@@ -702,6 +708,48 @@ async def rename_instrument(
 # ADMIN — RUN VALUATION
 # ─────────────────────────────────────────────────────────────────────────────
 
+async def _revalue_subscription(sub_id, db: AsyncSession, valuation_date=None, created_by=None) -> Optional[dict]:
+    """
+    Creates one fresh PortfolioValuation snapshot for a single subscription,
+    from the CURRENT state of its holdings and latest known prices.
+
+    Shared by the admin "Run Valuation" action below and anything that
+    changes a holding's units directly (equity redemptions, in both
+    portfolio.py and redemptions.py) — without this, a client's displayed
+    portfolio value stays frozen at whatever the last full valuation run
+    computed, silently ignoring any trade made since, until someone
+    happens to manually re-run valuation for everyone.
+
+    Does NOT commit — the caller commits as part of its own transaction,
+    so a redemption and its resulting valuation land together atomically.
+    Returns the snapshot summary, or None if there are no active holdings
+    left to value (e.g. the position was fully redeemed).
+    """
+    valuation_date = valuation_date or datetime.now(timezone.utc)
+    holdings_result = await db.execute(
+        select(PortfolioHolding).where(
+            PortfolioHolding.subscription_id == sub_id,
+            PortfolioHolding.status != "redeemed",
+        )
+    )
+    holdings = holdings_result.scalars().all()
+    if not holdings:
+        return None
+
+    breakdown = [await _value_holding(h, valuation_date, db) for h in holdings]
+    equities_value = round(sum(b["value"] for b in breakdown if b["type"] == "equity"), 2)
+    fixed_income_value = round(sum(b["value"] for b in breakdown if b["type"] == "fixed_income"), 2)
+    total_value = round(equities_value + fixed_income_value, 2)
+
+    snapshot = PortfolioValuation(
+        subscription_id=sub_id, valuation_date=valuation_date,
+        equities_value=equities_value, fixed_income_value=fixed_income_value,
+        total_value=total_value, breakdown=breakdown, created_by=created_by,
+    )
+    db.add(snapshot)
+    return {"subscription_id": str(sub_id), "total_value": total_value}
+
+
 @router.post(
     "/run-valuation",
     summary="Revalue portfolios using the latest prices — can_manage_nav",
@@ -729,28 +777,9 @@ async def run_valuation(
 
     snapshots = []
     for sub_id in sub_ids:
-        holdings_result = await db.execute(
-            select(PortfolioHolding).where(
-                PortfolioHolding.subscription_id == sub_id,
-                PortfolioHolding.status != "redeemed",
-            )
-        )
-        holdings = holdings_result.scalars().all()
-        if not holdings:
-            continue
-
-        breakdown = [await _value_holding(h, valuation_date, db) for h in holdings]
-        equities_value = round(sum(b["value"] for b in breakdown if b["type"] == "equity"), 2)
-        fixed_income_value = round(sum(b["value"] for b in breakdown if b["type"] == "fixed_income"), 2)
-        total_value = round(equities_value + fixed_income_value, 2)
-
-        snapshot = PortfolioValuation(
-            subscription_id=sub_id, valuation_date=valuation_date,
-            equities_value=equities_value, fixed_income_value=fixed_income_value,
-            total_value=total_value, breakdown=breakdown, created_by=admin.id,
-        )
-        db.add(snapshot)
-        snapshots.append({"subscription_id": str(sub_id), "total_value": total_value})
+        result = await _revalue_subscription(sub_id, db, valuation_date, admin.id)
+        if result:
+            snapshots.append(result)
 
     db.add(AuditLog(
         action="Portfolio Valuation Run", target=f"{len(snapshots)} portfolio(s)",
