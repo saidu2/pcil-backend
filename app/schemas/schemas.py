@@ -11,7 +11,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 from pydantic import BaseModel, EmailStr, Field, ConfigDict, field_validator
-from typing import Optional, List, Any
+from typing import Optional, List, Any, Literal
 from datetime import datetime
 from uuid import UUID
 
@@ -396,6 +396,13 @@ class KycSubmit(BaseModel):
     Sent by the frontend KYC.jsx form on submission.
     Documents are uploaded separately via POST /api/v1/kyc/documents/upload
     """
+    # Account type — the client's actual choice on the KYC form. Was
+    # previously not collected at all here, meaning every user's
+    # account_type stayed stuck at whatever it was set to at signup
+    # (never Corporate/Joint/Minor, no matter what was chosen on this
+    # form) — see submit_kyc() in kyc.py for the other half of the fix.
+    account_type: Optional[Literal["individual", "joint", "minor", "corporate"]] = None
+
     # Personal
     date_of_birth: Optional[str] = None
     nationality: Optional[str] = None

@@ -142,9 +142,15 @@ async def submit_kyc(
             detail="Your KYC is already approved. No need to resubmit."
         )
 
+    # account_type belongs on User, not KycSubmission (that model has no
+    # such column) — pull it out before the generic field-copy below, then
+    # apply it to the user explicitly alongside kyc_status.
+    submitted_data = body.model_dump(exclude_unset=True)
+    submitted_account_type = submitted_data.pop("account_type", None)
+
     if kyc:
         # Resubmission — update existing record (e.g. after denial)
-        for field, value in body.model_dump(exclude_unset=True).items():
+        for field, value in submitted_data.items():
             setattr(kyc, field, value)
         kyc.status = "pending"
         kyc.denial_reason = None
@@ -160,15 +166,23 @@ async def submit_kyc(
         kyc = KycSubmission(
             user_id=current_user.id,
             status="pending",
-            **body.model_dump(exclude_unset=True),
+            **submitted_data,
         )
         db.add(kyc)
 
-    # Update user's kyc_status
+    # Update user's kyc_status — and account_type, if the client actually
+    # chose one on this submission. Previously this only updated
+    # kyc_status, so account_type silently never changed from whatever it
+    # was at signup, regardless of what was submitted here (the root cause
+    # of the admin panel always showing "Individual").
+    user_update_values = {"kyc_status": "pending"}
+    if submitted_account_type:
+        user_update_values["account_type"] = submitted_account_type
+
     await db.execute(
         update(User)
         .where(User.id == current_user.id)
-        .values(kyc_status="pending")
+        .values(**user_update_values)
     )
 
     await db.flush()
