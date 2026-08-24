@@ -212,3 +212,27 @@ def send_email_verification(to: str, full_name: str, verify_url: str, expires_ho
         body_text=f"Hello {full_name},\n\nConfirm your email address: {verify_url}\n\n"
                   f"This link is valid for {expires_hours} hours.",
     )
+
+
+def send_kyc_submitted_alert(to: str, staff_name: str, client_name: str, client_email: str, is_resubmission: bool = False) -> bool:
+    """
+    Alerts a staff member with can_approve_kyc (or a super admin) that a
+    client has submitted KYC. Sent to each qualifying staff member
+    individually, straight to their own registered login email — not a
+    shared inbox. Fired once per submission, right alongside the existing
+    workflow-instance side effect, so staff no longer have to actively open
+    KYC Management or My Tasks to notice a new submission.
+    """
+    verb = "resubmitted" if is_resubmission else "submitted"
+    return send_email(
+        to, f"New KYC {verb}: {client_name}",
+        _wrap(
+            "New KYC submission",
+            f"<p>Hello {staff_name},</p>"
+            f"<p><strong>{client_name}</strong> ({client_email}) has just {verb} their KYC "
+            f"for review.</p>"
+            f"<p>Sign in to review it under KYC Management or My Tasks.</p>",
+        ),
+        body_text=f"Hello {staff_name},\n\n{client_name} ({client_email}) has just {verb} their KYC for review.\n\n"
+                  f"Sign in to review it under KYC Management or My Tasks.",
+    )

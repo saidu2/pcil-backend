@@ -33,12 +33,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
-from app.models.models import KycSubmission, User, Notification, AuditLog, Workflow, WorkflowInstance
+from app.models.models import KycSubmission, User, Notification, AuditLog, Workflow, WorkflowInstance, AdminUser, StaffRole
 from app.schemas.schemas import (
     KycSubmit, KycResponse, KycAdminOverride, MessageResponse
 )
 from app.core.storage import save_file, build_filename, read_file_bytes
-from app.core.mailer import send_kyc_decision
+from app.core.mailer import send_kyc_decision, send_kyc_submitted_alert
 from app.api.v1.deps import get_current_user, get_current_admin, require_permission
 
 logger = logging.getLogger(__name__)
@@ -102,6 +102,47 @@ async def _fire_workflow(trigger: str, record_type: str, record_id, client_id, c
         logger.warning(f"Workflow trigger failed silently ({trigger}): {e}")
 
 
+async def _notify_staff_kyc_submitted(client_name: str, client_email: str, is_resubmission: bool, db: AsyncSession):
+    """
+    Emails every active staff member qualified to approve KYC — super admins,
+    plus anyone whose staff_role has can_approve_kyc=True — the moment a
+    client submits. Previously nothing proactively told staff a submission
+    had arrived; they had to actively open KYC Management or My Tasks to
+    notice one. This closes that gap without needing a schema change: it
+    reuses the existing Resend/SMTP mailer, not an in-app notification (the
+    Notification table is a hard FK to users.id, client-only by design — an
+    in-app staff notification bell would need its own new table and is a
+    separate piece of work).
+
+    Silent on failure, same as _fire_workflow above: a mail server hiccup
+    must never roll back the KYC submission itself. One bad send doesn't
+    stop the rest — each recipient is emailed independently.
+    """
+    try:
+        result = await db.execute(
+            select(AdminUser).outerjoin(StaffRole, AdminUser.staff_role_id == StaffRole.id).where(
+                AdminUser.is_active == True,
+                (AdminUser.role == "super_admin") | (StaffRole.can_approve_kyc == True),
+            )
+        )
+        staff = result.scalars().unique().all()
+        if not staff:
+            logger.info("No staff qualified for KYC-submitted alerts (no super admin or can_approve_kyc role found).")
+            return
+
+        for admin in staff:
+            try:
+                send_kyc_submitted_alert(
+                    to=admin.email, staff_name=admin.full_name,
+                    client_name=client_name, client_email=client_email,
+                    is_resubmission=is_resubmission,
+                )
+            except Exception as e:
+                logger.warning(f"Could not send KYC-submitted alert to {admin.email}: {e}")
+    except Exception as e:
+        logger.warning(f"Staff KYC-submitted notification failed silently: {e}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CLIENT ENDPOINTS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -135,6 +176,7 @@ async def submit_kyc(
         select(KycSubmission).where(KycSubmission.user_id == current_user.id)
     )
     kyc = existing.scalar_one_or_none()
+    is_resubmission = kyc is not None
 
     if kyc and kyc.status == "approved":
         raise HTTPException(
@@ -212,6 +254,17 @@ async def submit_kyc(
         client_name=current_user.full_name,
         db=db,
     )
+
+    # Email staff qualified to approve KYC. Independent of whether a
+    # workflow is configured — this fires regardless, so submissions are
+    # never silently invisible to staff even if My Tasks has nothing set up.
+    await _notify_staff_kyc_submitted(
+        client_name=current_user.full_name,
+        client_email=current_user.email,
+        is_resubmission=is_resubmission,
+        db=db,
+    )
+
     await db.commit()
 
     logger.info(f"KYC submitted by {current_user.email}")
