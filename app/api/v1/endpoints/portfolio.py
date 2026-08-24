@@ -207,6 +207,74 @@ async def update_holding(
     return holding
 
 
+@router.delete(
+    "/holdings/{holding_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Permanently delete a holding — can_manage_nav",
+)
+async def delete_holding(
+    holding_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    admin: AdminUser = Depends(require_staff_permission("can_manage_nav")),
+):
+    """
+    Permanently removes a holding. This exists ONLY to correct a genuine
+    data-entry mistake — wrong instrument, wrong client, duplicate entry —
+    made before the holding was ever real to the client. It is NOT a way
+    to close out a real position; that is what redeem_holding is for,
+    since redemption leaves a proper record (sale price, realized gain,
+    a Redemption row) and this does not.
+
+    To guarantee that, deletion is blocked once the underlying
+    subscription's portfolio has ANY valuation history at all — not
+    per-holding, since valuations only store portfolio-level totals, not
+    which specific holdings they included. A holding added after the
+    portfolio's last valuation run could theoretically still be safe to
+    delete, but there is currently no per-holding record precise enough
+    to prove that, so this errs toward blocking rather than risking a
+    deletion that silently invalidates a number the client already saw.
+
+    This check is intentionally enforced here, not just in the frontend —
+    the Delete button there is hidden under the same condition, but that
+    is a UX convenience, not a guarantee. A direct API call must be
+    stopped independently of whatever the UI happens to show.
+    """
+    holding = await db.get(PortfolioHolding, holding_id)
+    if not holding:
+        raise HTTPException(status_code=404, detail="Holding not found.")
+
+    has_valuation_history = (await db.execute(
+        select(PortfolioValuation.id)
+        .where(PortfolioValuation.subscription_id == holding.subscription_id)
+        .limit(1)
+    )).scalar_one_or_none()
+
+    if has_valuation_history:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This portfolio already has valuation history, so this holding "
+                "may have contributed to a value the client has seen. It can no "
+                "longer be deleted — use Redeem instead to close it out with a "
+                "proper record."
+            ),
+        )
+
+    db.add(AuditLog(
+        action="Portfolio Holding Deleted", target=holding.instrument_name, target_id=str(holding_id),
+        action_type="admin", performed_by=admin.id, performed_by_name=admin.full_name,
+        details={
+            "holding_type": holding.holding_type,
+            "instrument_name": holding.instrument_name,
+            "subscription_id": str(holding.subscription_id),
+            "reason": "data_entry_correction",
+        },
+    ))
+    await db.delete(holding)
+    await db.commit()
+    return None
+
+
 def _generate_redemption_reference() -> str:
     """
     Unique, human-scannable reference for a redemption record, e.g.
