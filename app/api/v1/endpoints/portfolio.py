@@ -225,14 +225,14 @@ async def delete_holding(
     since redemption leaves a proper record (sale price, realized gain,
     a Redemption row) and this does not.
 
-    To guarantee that, deletion is blocked once the underlying
-    subscription's portfolio has ANY valuation history at all — not
-    per-holding, since valuations only store portfolio-level totals, not
-    which specific holdings they included. A holding added after the
-    portfolio's last valuation run could theoretically still be safe to
-    delete, but there is currently no per-holding record precise enough
-    to prove that, so this errs toward blocking rather than risking a
-    deletion that silently invalidates a number the client already saw.
+    Deletion is blocked if THIS SPECIFIC holding's id appears in any past
+    valuation snapshot's breakdown for its subscription — meaning it was
+    actually included in a value the client may have already seen. This is
+    checked per-holding, not per-portfolio: an existing client's portfolio
+    can already have valuation history while a holding just added to it
+    today has never been part of any snapshot, and that new holding should
+    still be deletable. Each PortfolioValuation.breakdown entry carries the
+    holding_id it valued, which is what makes this precise check possible.
 
     This check is intentionally enforced here, not just in the frontend —
     the Delete button there is hidden under the same condition, but that
@@ -243,20 +243,26 @@ async def delete_holding(
     if not holding:
         raise HTTPException(status_code=404, detail="Holding not found.")
 
-    has_valuation_history = (await db.execute(
-        select(PortfolioValuation.id)
+    valuations = (await db.execute(
+        select(PortfolioValuation.breakdown)
         .where(PortfolioValuation.subscription_id == holding.subscription_id)
-        .limit(1)
-    )).scalar_one_or_none()
+    )).scalars().all()
 
-    if has_valuation_history:
+    holding_id_str = str(holding.id)
+    ever_valued = any(
+        entry.get("holding_id") == holding_id_str
+        for breakdown in valuations if breakdown
+        for entry in breakdown
+    )
+
+    if ever_valued:
         raise HTTPException(
             status_code=400,
             detail=(
-                "This portfolio already has valuation history, so this holding "
-                "may have contributed to a value the client has seen. It can no "
-                "longer be deleted — use Redeem instead to close it out with a "
-                "proper record."
+                "This holding has already been included in a past valuation, "
+                "so it may have contributed to a value the client has seen. "
+                "It can no longer be deleted — use Redeem instead to close it "
+                "out with a proper record."
             ),
         )
 
